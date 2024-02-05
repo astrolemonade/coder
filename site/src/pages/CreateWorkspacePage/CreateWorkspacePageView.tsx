@@ -31,7 +31,7 @@ import {
 import { useSearchParams } from "react-router-dom";
 import { CreateWSPermissions } from "./permissions";
 import { Alert } from "components/Alert/Alert";
-import { ExternalAuthBanner } from "./ExternalAuthBanner/ExternalAuthBanner";
+import { ExternalAuthWall } from "./ExternalAuthWall/ExternalAuthWall";
 import { Margins } from "components/Margins/Margins";
 import Button from "@mui/material/Button";
 import { Avatar } from "components/Avatar/Avatar";
@@ -163,7 +163,7 @@ export const CreateWorkspacePageView: FC<CreateWorkspacePageViewProps> = ({
       </PageHeader>
 
       {requiresExternalAuth ? (
-        <ExternalAuthBanner
+        <ExternalAuthWall
           providers={externalAuth}
           pollingState={externalAuthPollingState}
           onStartPolling={startPollingExternalAuth}
