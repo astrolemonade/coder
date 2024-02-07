@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"golang.org/x/exp/slices"
 	"golang.org/x/xerrors"
 
 	"cdr.dev/slog"
@@ -14,7 +13,11 @@ import (
 	"github.com/coder/coder/v2/codersdk/agentsdk"
 )
 
-const flushInterval = time.Second
+const (
+	flushInterval     = time.Second
+	logOutputMaxBytes = 1 << 20 // 1MiB
+	overheadPerLog    = 21      // found by testing
+)
 
 type logQueue struct {
 	logs           []*proto.Log
@@ -118,15 +121,30 @@ func (l *logSender) sendLoop(ctx context.Context, dest logDest) error {
 			return nil
 		}
 		src, q := l.getPendingWorkLocked()
+		logger := l.logger.With(slog.F("log_source_id", src))
 		q.flushRequested = false // clear flag since we're now flushing
 		req := &proto.BatchCreateLogsRequest{
 			LogSourceId: src[:],
-			// when we release the lock, we don't want modifications to the slice to affect us
-			Logs: slices.Clone(q.logs),
+		}
+		o := 0
+		n := 0
+		for n < len(q.logs) {
+			log := q.logs[n]
+			if len(log.Output) > logOutputMaxBytes {
+				logger.Warn(ctx, "dropping log line that exceeds our limit")
+				n++
+				continue
+			}
+			o += len(log.Output) + overheadPerLog
+			if o > logOutputMaxBytes {
+				break
+			}
+			req.Logs = append(req.Logs, log)
+			n++
 		}
 
 		l.L.Unlock()
-		l.logger.Debug(ctx, "sending logs to agent API", slog.F("log_source_id", src), slog.F("num_logs", len(req.Logs)))
+		logger.Debug(ctx, "sending logs to agent API", slog.F("num_logs", len(req.Logs)))
 		_, err := dest.BatchCreateLogs(ctx, req)
 		l.L.Lock()
 		if err != nil {
@@ -135,7 +153,7 @@ func (l *logSender) sendLoop(ctx context.Context, dest logDest) error {
 
 		// since elsewhere we only append to the logs, here we can remove them
 		// since we successfully sent them
-		q.logs = q.logs[len(req.Logs):]
+		q.logs = q.logs[n:]
 		if len(q.logs) == 0 {
 			// no empty queues
 			delete(l.queues, src)
