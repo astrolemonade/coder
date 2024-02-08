@@ -14,9 +14,14 @@ import (
 )
 
 const (
-	flushInterval     = time.Second
-	logOutputMaxBytes = 1 << 20 // 1MiB
-	overheadPerLog    = 21      // found by testing
+	flushInterval    = time.Second
+	maxBytesPerBatch = 1 << 20 // 1MiB
+	overheadPerLog   = 21      // found by testing
+
+	// maxBytesQueued is the maximum length of logs we will queue in memory.  The number is taken
+	// from dump.sql `max_logs_length` constraint, as there is no point queuing more logs than we'll
+	// accept in the database.
+	maxBytesQueued = 1048576
 )
 
 type logQueue struct {
@@ -30,8 +35,9 @@ type logQueue struct {
 // the agent calls sendLoop to send pending logs.
 type logSender struct {
 	*sync.Cond
-	queues map[uuid.UUID]*logQueue
-	logger slog.Logger
+	queues    map[uuid.UUID]*logQueue
+	logger    slog.Logger
+	outputLen int
 }
 
 type logDest interface {
@@ -45,6 +51,8 @@ func newLogSender(logger slog.Logger) *logSender {
 		queues: make(map[uuid.UUID]*logQueue),
 	}
 }
+
+var MaxQueueExceededError = xerrors.New("maximum queued logs exceeded")
 
 func (l *logSender) enqueue(src uuid.UUID, logs ...agentsdk.Log) error {
 	logger := l.logger.With(slog.F("log_source_id", src))
@@ -60,12 +68,25 @@ func (l *logSender) enqueue(src uuid.UUID, logs ...agentsdk.Log) error {
 		q = &logQueue{}
 		l.queues[src] = q
 	}
-	for _, log := range logs {
+	for k, log := range logs {
+		// Here we check the queue size before adding a log because we want to queue up slightly
+		// more logs than the database would store to ensure we trigger "logs truncated" at the
+		// database layer.  Otherwise, the end user wouldn't know logs are truncated unless they
+		// examined the Coder agent logs.
+		if l.outputLen > maxBytesQueued {
+			logger.Warn(context.Background(), "log queue full; truncating new logs", slog.F("new_logs", k), slog.F("queued_logs", len(q.logs)))
+			return MaxQueueExceededError
+		}
 		pl, err := agentsdk.ProtoFromLog(log)
 		if err != nil {
 			return xerrors.Errorf("failed to convert log: %w", err)
 		}
+		if len(pl.Output) > maxBytesPerBatch {
+			logger.Warn(context.Background(), "dropping log line that exceeds our limit")
+			continue
+		}
 		q.logs = append(q.logs, pl)
+		l.outputLen += len(pl.Output)
 	}
 	logger.Debug(context.Background(), "enqueued agent logs", slog.F("new_logs", len(logs)), slog.F("queued_logs", len(q.logs)))
 	return nil
@@ -126,21 +147,22 @@ func (l *logSender) sendLoop(ctx context.Context, dest logDest) error {
 		req := &proto.BatchCreateLogsRequest{
 			LogSourceId: src[:],
 		}
-		o := 0
+
+		// outputToSend keeps track of the size of the protobuf message we send, while
+		// outputToRemove keeps track of the size of the output we'll remove from the queues on
+		// success.  They are different because outputToSend also counts protocol message overheads.
+		outputToSend := 0
+		outputToRemove := 0
 		n := 0
 		for n < len(q.logs) {
 			log := q.logs[n]
-			if len(log.Output) > logOutputMaxBytes {
-				logger.Warn(ctx, "dropping log line that exceeds our limit")
-				n++
-				continue
-			}
-			o += len(log.Output) + overheadPerLog
-			if o > logOutputMaxBytes {
+			outputToSend += len(log.Output) + overheadPerLog
+			if outputToSend > maxBytesPerBatch {
 				break
 			}
 			req.Logs = append(req.Logs, log)
 			n++
+			outputToRemove += len(log.Output)
 		}
 
 		l.L.Unlock()
@@ -154,6 +176,7 @@ func (l *logSender) sendLoop(ctx context.Context, dest logDest) error {
 		// since elsewhere we only append to the logs, here we can remove them
 		// since we successfully sent them
 		q.logs = q.logs[n:]
+		l.outputLen -= outputToRemove
 		if len(q.logs) == 0 {
 			// no empty queues
 			delete(l.queues, src)
