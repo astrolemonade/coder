@@ -91,7 +91,6 @@ type Client interface {
 	ConnectRPC(ctx context.Context) (drpc.Conn, error)
 	PostLifecycle(ctx context.Context, state agentsdk.PostLifecycleRequest) error
 	PostMetadata(ctx context.Context, req agentsdk.PostMetadataRequest) error
-	PatchLogs(ctx context.Context, req agentsdk.PatchLogs) error
 	RewriteDERPMap(derpMap *tailcfg.DERPMap)
 }
 
@@ -165,6 +164,7 @@ func New(options Options) Agent {
 		syscaller:                    options.Syscaller,
 		modifiedProcs:                options.ModifiedProcesses,
 		processManagementTick:        options.ProcessManagementTick,
+		logSender:                    newLogSender(options.Logger),
 
 		prometheusRegistry: prometheusRegistry,
 		metrics:            newAgentMetrics(prometheusRegistry),
@@ -215,6 +215,7 @@ type agent struct {
 	network       *tailnet.Conn
 	addresses     []netip.Prefix
 	statsReporter *statsReporter
+	logSender     *logSender
 
 	connCountReconnectingPTY atomic.Int64
 
@@ -245,11 +246,11 @@ func (a *agent) init(ctx context.Context) {
 	sshSrv.ServiceBanner = &a.serviceBanner
 	a.sshServer = sshSrv
 	a.scriptRunner = agentscripts.New(agentscripts.Options{
-		LogDir:     a.logDir,
-		Logger:     a.logger,
-		SSHServer:  sshSrv,
-		Filesystem: a.filesystem,
-		PatchLogs:  a.client.PatchLogs,
+		LogDir:          a.logDir,
+		Logger:          a.logger,
+		SSHServer:       sshSrv,
+		Filesystem:      a.filesystem,
+		GetScriptLogger: a.logSender.getScriptLogger,
 	})
 	// Register runner metrics. If the prom registry is nil, the metrics
 	// will not report anywhere.
@@ -872,6 +873,15 @@ func (a *agent) run(ctx context.Context) error {
 		err := a.statsReporter.reportLoop(egCtx, aAPI)
 		if err != nil {
 			return xerrors.Errorf("report stats loop: %w", err)
+		}
+		return nil
+	})
+
+	eg.Go(func() error {
+		a.logger.Debug(egCtx, "running send logs loop")
+		err := a.logSender.sendLoop(egCtx, aAPI)
+		if err != nil {
+			return xerrors.Errorf("send logs loop: %w", err)
 		}
 		return nil
 	})

@@ -85,7 +85,6 @@ type Client struct {
 	server             *drpcserver.Server
 	fakeAgentAPI       *FakeAgentAPI
 	LastWorkspaceAgent func()
-	PatchWorkspaceLogs func() error
 
 	mu              sync.Mutex // Protects following.
 	lifecycleStates []codersdk.WorkspaceAgentLifecycle
@@ -163,17 +162,6 @@ func (c *Client) GetStartupLogs() []agentsdk.Log {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.logs
-}
-
-func (c *Client) PatchLogs(ctx context.Context, logs agentsdk.PatchLogs) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.PatchWorkspaceLogs != nil {
-		return c.PatchWorkspaceLogs()
-	}
-	c.logs = append(c.logs, logs.Logs...)
-	c.logger.Debug(ctx, "patch startup logs", slog.F("req", logs))
-	return nil
 }
 
 func (c *Client) SetServiceBannerFunc(f func() (codersdk.ServiceBannerConfig, error)) {
@@ -257,9 +245,9 @@ func (*FakeAgentAPI) BatchUpdateMetadata(context.Context, *agentproto.BatchUpdat
 	panic("implement me")
 }
 
-func (*FakeAgentAPI) BatchCreateLogs(context.Context, *agentproto.BatchCreateLogsRequest) (*agentproto.BatchCreateLogsResponse, error) {
-	// TODO implement me
-	panic("implement me")
+func (f *FakeAgentAPI) BatchCreateLogs(ctx context.Context, req *agentproto.BatchCreateLogsRequest) (*agentproto.BatchCreateLogsResponse, error) {
+	f.logger.Info(ctx, "batch create logs called", slog.F("req", req))
+	return &agentproto.BatchCreateLogsResponse{}, nil
 }
 
 func NewFakeAgentAPI(t testing.TB, logger slog.Logger, manifest *agentproto.Manifest, statsCh chan *agentproto.Stats) *FakeAgentAPI {

@@ -9,6 +9,7 @@ import (
 	"golang.org/x/xerrors"
 
 	"cdr.dev/slog"
+	"github.com/coder/coder/v2/agent/agentscripts"
 	"github.com/coder/coder/v2/agent/proto"
 	"github.com/coder/coder/v2/codersdk/agentsdk"
 )
@@ -210,4 +211,31 @@ func (l *logSender) getPendingWorkLocked() (src uuid.UUID, q *logQueue) {
 		}
 	}
 	return src, q
+}
+
+func (l *logSender) getScriptLogger(logSourceID uuid.UUID) agentscripts.ScriptLogger {
+	return scriptLogger{srcID: logSourceID, sender: l}
+}
+
+type scriptLogger struct {
+	sender *logSender
+	srcID  uuid.UUID
+}
+
+func (s scriptLogger) Send(ctx context.Context, log ...agentsdk.Log) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return s.sender.enqueue(s.srcID, log...)
+	}
+}
+
+func (s scriptLogger) Flush(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return s.sender.flush(s.srcID)
+	}
 }
